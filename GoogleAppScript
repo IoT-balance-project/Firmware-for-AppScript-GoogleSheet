@@ -1,0 +1,29 @@
+function doPost(e) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("raw_data");
+
+  const now = new Date();
+  const dateString = Utilities.formatDate(now, Session.getScriptTimeZone(), "dd/MM/yy");
+  const timestamp = Utilities.formatDate(now, Session.getScriptTimeZone(), "dd/MM/yy HH:mm");
+
+  const data = [
+    dateString,
+    timestamp,
+    e.parameter.Temp,
+    e.parameter.RH,
+    e.parameter.LC_A,
+    e.parameter.LC_B,
+    e.parameter.LC_C,
+    e.parameter.LC_D,
+    e.parameter.LC_E,
+    e.parameter.LC_F,
+    e.parameter.LC_G,
+    e.parameter.LC_H,
+    e.parameter.LC_I,
+    e.parameter.LC_J,
+    e.parameter.LC_K,
+    e.parameter.LC_L
+  ];
+
+  sheet.appendRow(data);
+  return ContentService.createTextOutput("Success");
+}
