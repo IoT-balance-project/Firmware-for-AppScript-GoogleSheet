@@ -1,0 +1,273 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_SHT4x.h>
+#include "Button2.h"
+#include "HX711.h"
+#include "time.h"
+#include "esp_sleep.h"
+#include <esp_wpa2.h>
+
+// ====== CONFIGURATION ======
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define MAX_LOAD_CELLS 10
+const int LOADCELL_SCK_PIN = 25;
+// ตัด D(GPIO12) และ E(GPIO4) ออก
+const byte LOADCELL_PINS[MAX_LOAD_CELLS] = {13,15,14,26,17,16,18,5,23,19};
+const char LC_LABELS[MAX_LOAD_CELLS]      = {'A','B','C','F','G','H','I','J','K','L'};
+
+#define LEFT_BTN   36
+#define RIGHT_BTN  39
+#define BACK_BTN   0
+#define UP_BTN     34
+#define DOWN_BTN   33
+#define OK_BTN     35
+Button2 btnLeft(LEFT_BTN), btnRight(RIGHT_BTN), btnBack(BACK_BTN),
+        btnUp(UP_BTN), btnDown(DOWN_BTN), btnOK(OK_BTN);
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire);
+
+Adafruit_SHT4x sht40;
+HX711 scale[MAX_LOAD_CELLS];
+
+const char* ssid = "eduroam";
+const char* username = "xxxx";
+const char* password = "xxxx";
+const char* scriptURL = "xxxx";
+
+int current_page = 0;
+const int TOTAL_PAGES = 12;  // 0=Temp,1=RH,2–11=LC A–L(ตัด D,E แล้ว)
+unsigned long last_update_ms = 0;
+const unsigned long UPDATE_EVERY_MS = 300;
+const int totalCycleDurationMs = 3600000; // 1 hr 
+RTC_DATA_ATTR unsigned long lastSleepStartTime = 0;
+
+const long  gmtOffset_sec = 0;
+const char* ntpServer = "pool.ntp.org";
+const int   daylightOffset_sec = 3600;
+
+// ====== WiFi & NTP ======
+void connectEduroam() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  esp_wifi_sta_wpa2_ent_enable();
+  esp_wifi_sta_wpa2_ent_set_identity((uint8_t *)username, strlen(username));
+  esp_wifi_sta_wpa2_ent_set_username((uint8_t *)username, strlen(username));
+  esp_wifi_sta_wpa2_ent_set_password((uint8_t *)password, strlen(password));
+  WiFi.begin(ssid);
+
+  Serial.println("Connecting to eduroam...");
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry++ < 30) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected!");
+    Serial.println("IP: " + WiFi.localIP().toString());
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  } else Serial.println("\nWiFi failed");
+}
+
+String getCurrentTimeString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "??/??/?? ??:??";
+  char buf[20];
+  sprintf(buf,"%02d/%02d/%02d %02d:%02d",
+          timeinfo.tm_mday,timeinfo.tm_mon+1,timeinfo.tm_year%100,
+          timeinfo.tm_hour,timeinfo.tm_min);
+  return String(buf);
+}
+
+// ====== OLED ======
+void drawHeader(){
+  oled.setTextSize(1); oled.setTextColor(WHITE,BLACK);
+  oled.setCursor(0,0);
+  oled.print("WiFi:");
+  oled.print(WiFi.status()==WL_CONNECTED?"OK":"NO");
+  String pageText="P"+String(current_page);
+  int16_t x1,y1; uint16_t w,h;
+  oled.getTextBounds(pageText,0,0,&x1,&y1,&w,&h);
+  oled.setCursor(SCREEN_WIDTH-w-1,0);
+  oled.print(pageText);
+}
+void drawCenteredText(const String& line,int y,int size=2){
+  oled.setTextSize(size); oled.setTextColor(WHITE,BLACK);
+  int16_t x1,y1; uint16_t w,h;
+  oled.getTextBounds(line,0,0,&x1,&y1,&w,&h);
+  oled.setCursor((SCREEN_WIDTH-w)/2,y); oled.print(line);
+}
+
+// ====== HX711 Robust Read ======
+long readLoadcellRobust(HX711 &cell,int n=30,int drop=10,int toMs=3000){
+  if(!cell.is_ready()) return LONG_MIN;
+  static long buf[32]; int got=0; unsigned long t0=millis();
+  (void)cell.read();
+  while(got<n){
+    unsigned long t1=millis();
+    while(!cell.is_ready()){
+      if(millis()-t1>toMs) return LONG_MIN;
+      delay(1);
+    }
+    buf[got++]=cell.read();
+    delay(3);
+    if(millis()-t0>toMs) break;
+  }
+  if(got<(2*drop+1)) return LONG_MIN;
+  for(int i=1;i<got;i++){long v=buf[i];int j=i-1;while(j>=0&&buf[j]>v){buf[j+1]=buf[j];j--;}buf[j+1]=v;}
+  long sum=0; for(int i=drop;i<got-drop;i++) sum+=buf[i];
+  return sum/(got-2*drop);
+}
+
+// ====== OLED Pages ======
+void showPage(){
+  oled.clearDisplay(); drawHeader();
+  if(current_page==0){
+    sensors_event_t hum,temp; sht40.getEvent(&hum,&temp);
+    oled.setCursor(0,16); oled.setTextSize(1); oled.print("SHT40 Temp");
+    drawCenteredText(String(temp.temperature,2)+" C",32,3);
+  }else if(current_page==1){
+    sensors_event_t hum,temp; sht40.getEvent(&hum,&temp);
+    oled.setCursor(0,16); oled.setTextSize(1); oled.print("SHT40 RH");
+    drawCenteredText(String(hum.relative_humidity,1)+" %",32,3);
+  }else if(current_page>=2 && current_page<=11){
+    int i=current_page-2;
+    char label=LC_LABELS[i];
+    long val=scale[i].is_ready()?scale[i].read():0;
+    oled.setCursor(0,16); oled.setTextSize(1);
+    oled.print("Loadcell "); oled.print(label);
+    drawCenteredText(String(val),32,3);
+  }else{
+    oled.setCursor(0,16); oled.setTextSize(1);
+    oled.print("IP:"); oled.println(WiFi.localIP());
+    oled.print("MAC:"); oled.println(WiFi.macAddress());
+  }
+  oled.display();
+}
+
+// ====== Upload + Deep Sleep ======
+void sendToGoogleSheets(bool isAuto=false){
+  if(WiFi.status()!=WL_CONNECTED) connectEduroam();
+  if(WiFi.status()!=WL_CONNECTED){
+    Serial.println("❌ WiFi failed");
+    oled.clearDisplay(); drawCenteredText("WiFi Failed",24,2); oled.display();
+    delay(1000);
+    oled.ssd1306_command(SSD1306_DISPLAYOFF);
+    esp_sleep_enable_timer_wakeup(5000000);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_34,0);
+    esp_deep_sleep_start(); return;
+  }
+
+  unsigned long uploadStart=millis();
+  int httpFailCount=0;
+
+  for(int set=0; set<5; set++){
+    float tempSum=0,rhSum=0; String lcResult[MAX_LOAD_CELLS];
+
+    for(int i=0;i<10;i++){ sensors_event_t hum,temp;
+      sht40.getEvent(&hum,&temp);
+      tempSum+=temp.temperature; rhSum+=hum.relative_humidity; delay(100);
+    }
+
+    for(int i=0;i<MAX_LOAD_CELLS;i++){
+      long val=readLoadcellRobust(scale[i]);
+      lcResult[i]=(val==LONG_MIN)?"NA":String(val);
+      delay(500);
+    }
+
+    String postData="Round="+String(set+1)+
+      "&Timestamp="+getCurrentTimeString()+
+      "&Temp="+String(tempSum/10.0,2)+
+      "&RH="+String(rhSum/10.0,1);
+    for(int i=0;i<MAX_LOAD_CELLS;i++)
+      postData+="&LC_"+String(LC_LABELS[i])+"="+lcResult[i];
+
+    HTTPClient http;
+    http.begin(scriptURL);
+    http.setTimeout(30000);
+    http.addHeader("Content-Type","application/x-www-form-urlencoded");
+    int code=http.POST(postData);
+    http.end();
+
+    if(code<0){
+      httpFailCount++;
+      Serial.printf("❌ HTTP fail %d (code=%d)\n",httpFailCount,code);
+      if(httpFailCount>=3){ Serial.println("Restart..."); ESP.restart(); }
+      continue;
+    }
+    httpFailCount=0;
+    Serial.printf("✅ Upload %d OK (code=%d)\n",set+1,code);
+    oled.clearDisplay(); drawCenteredText("Uploaded "+String(set+1),24,2); oled.display();
+    delay(800);
+
+    if(millis()-uploadStart>300000){ Serial.println("Timeout restart"); ESP.restart(); }
+  }
+
+  if(isAuto){
+    unsigned long elapsed=millis()-lastSleepStartTime;
+    unsigned long remaining=(elapsed<totalCycleDurationMs)?(totalCycleDurationMs-elapsed):0;
+    Serial.printf("Sleep %.1f min\n",remaining/60000.0);
+    oled.clearDisplay(); drawCenteredText("Sleep "+String(remaining/60000.0,1)+" min",24,2); oled.display();
+    oled.ssd1306_command(SSD1306_DISPLAYOFF);
+    esp_sleep_enable_timer_wakeup((uint64_t)remaining*1000ULL);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_34,0);
+    esp_deep_sleep_start();
+  }
+}
+
+// ====== SETUP ======
+void setup(){
+  delay(300);
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA,I2C_SCL);
+  Wire.setTimeout(1000);
+  oled.begin(SSD1306_SWITCHCAPVCC,SCREEN_ADDRESS);
+  oled.clearDisplay(); drawCenteredText("Starting..",24); oled.display();
+
+  esp_sleep_wakeup_cause_t reason=esp_sleep_get_wakeup_cause();
+  connectEduroam();
+  sht40.begin(&Wire); sht40.setPrecision(SHT4X_HIGH_PRECISION); sht40.setHeater(SHT4X_NO_HEATER);
+  for(int i=0;i<MAX_LOAD_CELLS;i++){ scale[i].begin(LOADCELL_PINS[i],LOADCELL_SCK_PIN); delay(5); }
+
+  btnLeft.setClickHandler([](Button2&){ current_page=(TOTAL_PAGES+current_page-1)%TOTAL_PAGES; });
+  btnRight.setClickHandler([](Button2&){ current_page=(current_page+1)%TOTAL_PAGES; });
+  btnBack.setClickHandler([](Button2&){ current_page=0; });
+  btnOK.setClickHandler([](Button2&){ sendToGoogleSheets(false); });
+  btnDown.setClickHandler([](Button2&){
+    oled.clearDisplay(); drawCenteredText("Sleep Now",24,2); oled.display(); delay(1000);
+    unsigned long elapsed=millis()-lastSleepStartTime;
+    unsigned long remaining=(elapsed<totalCycleDurationMs)?(totalCycleDurationMs-elapsed):0;
+    oled.ssd1306_command(SSD1306_DISPLAYOFF);
+    esp_sleep_enable_timer_wakeup((uint64_t)remaining*1000ULL);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_34,0);
+    esp_deep_sleep_start();
+  });
+
+  if(reason==ESP_SLEEP_WAKEUP_EXT0){
+    unsigned long start=millis();
+    while(millis()-start<180000){
+      btnLeft.loop(); btnRight.loop(); btnBack.loop(); btnDown.loop(); btnOK.loop();
+      if(millis()-last_update_ms>UPDATE_EVERY_MS){ last_update_ms=millis(); showPage(); }
+    }
+    unsigned long elapsed=millis()-lastSleepStartTime;
+    unsigned long remaining=(elapsed<totalCycleDurationMs)?(totalCycleDurationMs-elapsed):0;
+    oled.ssd1306_command(SSD1306_DISPLAYOFF);
+    esp_sleep_enable_timer_wakeup((uint64_t)remaining*1000ULL);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_34,0);
+    esp_deep_sleep_start();
+  }
+
+  if(reason==ESP_SLEEP_WAKEUP_TIMER || reason==ESP_SLEEP_WAKEUP_UNDEFINED){
+    lastSleepStartTime=millis();
+    oled.clearDisplay(); drawCenteredText("AutoUpload..",24,2); oled.display();
+    sendToGoogleSheets(true);
+  }
+}
+
+void loop(){}
